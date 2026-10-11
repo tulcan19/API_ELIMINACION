@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "TikTok Repost Cleaner - Gestor de Compartidos",
+  "version": "1.0.0",
+  "description": "Permite escanear y eliminar de forma selectiva los videos compartidos (reposts) en TikTok.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.tiktok.com/*"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "TikTok Repost Cleaner"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.tiktok.com/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
