@@ -1,312 +1,359 @@
-// content.js - Se inyecta en las páginas de TikTok
+// content.js - Inyectado en TikTok
 
-// Escuchar mensajes desde el popup
+// Inyectar estilos directamente en el DOM para asegurar que siempre estén activos
+function injectStyles() {
+  if (document.getElementById('repost-cleaner-injected-style')) return;
+  const style = document.createElement('style');
+  style.id = 'repost-cleaner-injected-style';
+  style.textContent = `
+    .repost-cleaner-selected {
+      outline: 4px solid #ff0050 !important;
+      outline-offset: -4px !important;
+      box-shadow: 0 0 22px rgba(255, 0, 80, 0.9) !important;
+      border-radius: 8px !important;
+      filter: brightness(0.9) !important;
+      transition: all 0.2s ease !important;
+    }
+
+    .repost-cleaner-badge {
+      position: absolute !important;
+      top: 10px !important;
+      left: 10px !important;
+      z-index: 999999 !important;
+      width: 28px !important;
+      height: 28px !important;
+      background-color: rgba(0, 0, 0, 0.75) !important;
+      border: 2px solid #ffffff !important;
+      border-radius: 50% !important;
+      cursor: pointer !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.7) !important;
+      pointer-events: auto !important;
+    }
+
+    .repost-cleaner-badge:hover {
+      transform: scale(1.15) !important;
+      border-color: #ff0050 !important;
+    }
+
+    .repost-cleaner-badge.checked {
+      background-color: #ff0050 !important;
+      border-color: #ffffff !important;
+    }
+
+    .repost-cleaner-badge.checked::after {
+      content: '✓' !important;
+      color: #ffffff !important;
+      font-size: 16px !important;
+      font-weight: 900 !important;
+      line-height: 1 !important;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+injectStyles();
+
+let selectedUrls = new Set();
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  injectStyles();
+
   if (request.action === "SCAN_REPOSTS") {
-    scanForReposts()
-      .then((videos) => sendResponse({ success: true, videos: videos }))
-      .catch((err) => sendResponse({ success: false, error: err }));
+    const videos = scanForReposts();
+    sendResponse({ success: true, videos: videos });
+    return true;
+  }
+
+  if (request.action === "SET_VIDEO_SELECTED") {
+    toggleSelect(request.url, request.selected);
+    sendResponse({ success: true });
+    return true;
+  }
+
+  if (request.action === "SET_ALL_SELECTED") {
+    setAllSelected(request.selected);
+    sendResponse({ success: true });
     return true;
   }
 
   if (request.action === "DELETE_REPOST") {
-    deleteRepost(request.index)
-      .then(() => sendResponse({ success: true }))
-      .catch((err) => sendResponse({ success: false, error: err }));
-    return true; // Indica respuesta asíncrona
+    deleteRepost(request.url)
+      .then((ok) => {
+        if (ok) selectedUrls.delete(request.url);
+        sendResponse({ success: ok, error: ok ? undefined : 'TikTok no confirmó que se quitara la publicación compartida.' });
+      })
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true; 
   }
 });
 
-// Función para escanear la página y encontrar solo los videos del bloque activo de compartidos
-async function scanForReposts() {
-  const maxScrolls = 8;
+function isVisibleElement(el) {
+  if (!el || !document.contains(el)) return false;
+  const style = window.getComputedStyle(el);
+  return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
+}
+
+// Encuentra la tarjeta contenedora real del video en el grid de TikTok
+function getCardElement(linkEl) {
+  let el = linkEl;
+  while (el && el !== document.body) {
+    if (el.tagName === 'DIV' && el.clientHeight > 100 && el.clientWidth > 80) {
+      return el;
+    }
+    el = el.parentElement;
+  }
+  return linkEl.parentElement || linkEl;
+}
+
+function normalizeText(text) {
+  return text ? text.toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '') : '';
+}
+
+function findByText(keywords) {
+  const nodes = document.querySelectorAll('button, [role="button"], [role="menuitem"], li, a, span, [title], [aria-label]');
+  for (const el of nodes) {
+    if (!isVisibleElement(el)) continue;
+    const labels = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText, el.textContent]
+      .map(normalizeText)
+      .filter(label => label && label.length < 80);
+    if (labels.some(label => keywords.some(keyword => label.includes(normalizeText(keyword))))) {
+      return findClickableAncestor(el);
+    }
+  }
+  return null;
+}
+
+function findClickableAncestor(el) {
+  const clickable = el.closest('button, [role="button"], [role="menuitem"], a, li');
+  if (clickable) return clickable;
+
+  let ancestor = el;
+  for (let depth = 0; ancestor && ancestor !== document.body && depth < 5; depth++, ancestor = ancestor.parentElement) {
+    if (window.getComputedStyle(ancestor).cursor === 'pointer') return ancestor;
+  }
+  return el;
+}
+
+function findDirectRemoveRepostButton() {
+  return findByText([
+    'eliminar la publicacion compartida',
+    'quitar la publicacion compartida',
+    'eliminar publicacion compartida',
+    'remove shared post'
+  ]);
+}
+
+function findDirectRepostButton() {
+  return findByText(['republicar', 'repost']);
+}
+
+async function clickAndVerifyDirectRemove(button) {
+  button.click();
+  await sleep(1200);
+  return true;
+}
+
+async function isPostRemovedFromGrid(postId) {
+  for (let attempt = 0; attempt < 14; attempt++) {
+    const matchingLink = [...document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]')]
+      .find(link => link.href.match(/\/(?:video|photo)\/(\d+)/)?.[1] === postId);
+    if (!matchingLink || !isVisibleElement(matchingLink)) return true;
+    await sleep(700);
+  }
+  return false;
+}
+
+function toggleSelect(url, forceState = null) {
+  const shouldSelect = forceState !== null ? forceState : !selectedUrls.has(url);
+  if (shouldSelect) {
+    selectedUrls.add(url);
+  } else {
+    selectedUrls.delete(url);
+  }
+
+  updateVideoVisualState(url, shouldSelect);
+}
+
+function setAllSelected(shouldSelect) {
+  const postLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+  postLinks.forEach(link => {
+    if (!isVisibleElement(link)) return;
+    const urlMatch = link.href.match(/https?:\/\/www\.tiktok\.com\/@[^/]+\/(?:video|photo)\/\d+/);
+    if (urlMatch) {
+      const cleanUrl = urlMatch[0];
+      if (shouldSelect) selectedUrls.add(cleanUrl);
+      else selectedUrls.delete(cleanUrl);
+      updateVideoVisualState(cleanUrl, shouldSelect);
+    }
+  });
+}
+
+function updateVideoVisualState(url, isSelected) {
+  const postIdMatch = url.match(/\/(?:video|photo)\/(\d+)/);
+  if (!postIdMatch) return;
+  const postId = postIdMatch[1];
+
+  const linkEl = document.querySelector(`a[href*="${postId}"]`);
+  if (!linkEl) return;
+
+  const card = getCardElement(linkEl);
+  if (!card) return;
+
+  if (isSelected) {
+    card.classList.add('repost-cleaner-selected');
+  } else {
+    card.classList.remove('repost-cleaner-selected');
+  }
+
+  const badge = card.querySelector('.repost-cleaner-badge');
+  if (badge) {
+    if (isSelected) {
+      badge.classList.add('checked');
+    } else {
+      badge.classList.remove('checked');
+    }
+  }
+}
+
+function scanForReposts() {
+  injectStyles();
+  const postLinks = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
   const uniqueVideos = new Map();
 
-  for (let step = 0; step <= maxScrolls; step++) {
-    const candidateLinks = getCandidateVideoLinks();
-
-    candidateLinks.forEach(link => {
-      if (!isVisibleElement(link)) return;
-
-      const urlMatch = link.href.match(/tiktok\.com\/@[^/]+\/video\/\d+/);
-      if (!urlMatch) return;
-
+  postLinks.forEach(link => {
+    if (!isVisibleElement(link)) return;
+    const urlMatch = link.href.match(/https?:\/\/www\.tiktok\.com\/@[^/]+\/(?:video|photo)\/\d+/);
+    if (urlMatch) {
       const cleanUrl = urlMatch[0];
       if (!uniqueVideos.has(cleanUrl)) {
         uniqueVideos.set(cleanUrl, link);
       }
-    });
-
-    if (step < maxScrolls) {
-      const scrollTarget = Math.min(document.body.scrollHeight, window.scrollY + window.innerHeight * 1.5);
-      window.scrollTo({ top: scrollTarget, behavior: 'auto' });
-      await sleep(900);
     }
-  }
-
+  });
+  
   const videos = [];
-  let i = 0;
+  uniqueVideos.forEach((linkEl, url) => {
+    const card = getCardElement(linkEl);
+    
+    // Asegurar que la tarjeta tenga position relative para ubicar la casilla
+    const computedPos = window.getComputedStyle(card).position;
+    if (computedPos === 'static') {
+      card.style.position = 'relative';
+    }
 
-  uniqueVideos.forEach((linkElement) => {
-    linkElement.setAttribute('data-repost-cleaner-id', i);
-    videos.push({
-      index: i,
-      found: true
+    // Insertar casilla circular flotante si no existe
+    let badge = card.querySelector('.repost-cleaner-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'repost-cleaner-badge';
+      badge.title = 'Marcar para eliminar';
+
+      // Capturar clic antes de que TikTok abra el video
+      badge.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        toggleSelect(url);
+      }, true);
+
+      card.appendChild(badge);
+    }
+
+    const isSelected = selectedUrls.has(url);
+    if (isSelected) {
+      badge.classList.add('checked');
+      card.classList.add('repost-cleaner-selected');
+    } else {
+      badge.classList.remove('checked');
+      card.classList.remove('repost-cleaner-selected');
+    }
+
+    let title = linkEl.getAttribute('title') || 
+                card.querySelector('img')?.getAttribute('alt') ||
+                card.innerText?.trim() || 
+                '';
+    if (title.length > 50) title = title.substring(0, 47) + '...';
+
+    videos.push({ 
+      url: url,
+      title: title || `Publicación ${url.split('/').pop()}`,
+      selected: isSelected
     });
-    i++;
   });
 
   return videos;
 }
 
-function getCandidateVideoLinks() {
-  const scopeRoot = findSharedSectionScope();
-  if (scopeRoot) {
-    return [...scopeRoot.querySelectorAll('a[href*="/video/"]')];
-  }
-
-  return [...document.querySelectorAll('a[href*="/video/"]')];
-}
-
-function findSharedSectionScope() {
-  const tabTexts = ['compartidos', 'reposts', 'shared'];
-  const possibleTabs = [...document.querySelectorAll('button, [role="tab"], a, div, span')].filter((el) => {
-    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
-    return tabTexts.some((keyword) => text.includes(keyword));
-  });
-
-  for (const tab of possibleTabs) {
-    const isActive =
-      tab.getAttribute('aria-selected') === 'true' ||
-      tab.getAttribute('data-selected') === 'true' ||
-      tab.classList.contains('active') ||
-      tab.classList.contains('is-active');
-
-    if (!isActive) continue;
-
-    const scope = tab.closest('[role="tablist"], section, main, div') || tab.parentElement || document.body;
-    if (scope && scope.querySelector('a[href*="/video/"]')) {
-      return scope;
-    }
-  }
-
-  return null;
-}
-
-function isVisibleElement(element) {
-  if (!element || !document.body.contains(element)) return false;
-
-  const style = window.getComputedStyle(element);
-  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
-    return false;
-  }
-
-  return element.offsetParent !== null || element.getClientRects().length > 0;
-}
-
-// Función para simular el click y eliminar el repost
-async function deleteRepost(index) {
-  let lastError = null;
-
-  for (let attempt = 0; attempt < 4; attempt++) {
+async function deleteRepost(url) {
+  return new Promise(async (resolve) => {
     try {
-      const videoCard = document.querySelector(`[data-repost-cleaner-id="${index}"]`);
-      if (!videoCard) {
-        return false;
+      const postIdMatch = url.match(/\/(?:video|photo)\/(\d+)/);
+      if (!postIdMatch) return resolve(false);
+      const postId = postIdMatch[1];
+
+      const linkEl = document.querySelector(`a[href*="${postId}"]`);
+      if (!linkEl || !isVisibleElement(linkEl)) {
+        return resolve(false);
       }
 
-      if (typeof videoCard.click === 'function') {
-        videoCard.click();
+      // 1. Abrir video
+      linkEl.click();
+      await sleep(3000);
+
+      // En esta interfaz TikTok ofrece el toggle amarillo directamente en la barra de acciones.
+      const directRemoveButton = findDirectRemoveRepostButton();
+      if (directRemoveButton) {
+        await clickAndVerifyDirectRemove(directRemoveButton);
       } else {
-        videoCard.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+        const shareButton = document.querySelector('[data-e2e="share-icon"]') || findByText(['share', 'compartir']);
+        if (!shareButton) {
+          closeModal();
+          return resolve(false);
+        }
+
+        shareButton.click();
+        await sleep(1200);
+
+        const removeBtn = findByText([
+          'quitar republicacion', 'quitar la republicacion',
+          'eliminar republicacion', 'eliminar la republicacion',
+          'deshacer republicacion', 'remove repost', 'undo repost'
+        ]);
+        if (!removeBtn) {
+          closeModal();
+          return resolve(false);
+        }
+
+        removeBtn.click();
+        await sleep(1500);
       }
 
-      await sleep(2200 + attempt * 600);
+      // 4. Cerrar
+      closeModal();
+      await sleep(1000);
 
-      const shareButton = await retryUntilFound(findShareButton, 5, 500);
-      if (!shareButton) {
-        lastError = new Error('Share button not found');
-        await tryCloseVideo();
-        continue;
-      }
+      resolve(await isPostRemovedFromGrid(postId));
 
-      clickElement(shareButton);
-      await sleep(1200 + attempt * 400);
-
-      const removeButton = await retryUntilFound(findRemoveRepostButton, 6, 600);
-      if (!removeButton) {
-        lastError = new Error('Remove repost button not found');
-        await tryCloseVideo();
-        continue;
-      }
-
-      clickElement(removeButton);
-      await sleep(1800 + attempt * 400);
-
-      const didRemove = await verifyRemoveAction();
-      if (didRemove) {
-        await tryCloseVideo();
-        return true;
-      }
-
-      await tryCloseVideo();
     } catch (e) {
-      lastError = e;
-      await tryCloseVideo();
+      console.error(e);
+      closeModal();
+      reject(e);
     }
-  }
-
-  console.error('No se pudo eliminar el repost:', lastError);
-  return false;
+  });
 }
 
-async function retryUntilFound(findFn, maxRetries, delayMs) {
-  for (let i = 0; i < maxRetries; i++) {
-    const result = findFn();
-    if (result) return result;
-    await sleep(delayMs);
-  }
-  return null;
-}
-
-async function verifyRemoveAction() {
-  const currentUrl = window.location.href;
-  if (currentUrl.includes('/video/')) {
-    const closeButton = findCloseButton();
-    if (closeButton) {
-      return true;
-    }
-  }
-
-  const currentSelection = document.querySelectorAll('a[href*="/video/"]');
-  if (currentSelection.length > 0) {
-    const ids = [...currentSelection].map(el => el.href).filter(href => /tiktok\.com\/.*\/video\/\d+/.test(href));
-    return ids.length === 0 || ids.some(url => !url.includes('repost-cleaner-id'));
-  }
-
-  return true;
-}
-
-function findShareButton() {
-  const selectors = [
-    'button[data-e2e="share-icon"]',
-    'button[aria-label*="Share"]',
-    'button[aria-label*="Compartir"]',
-    '[data-e2e="share-icon"]',
-    'button[title*="Share"]',
-    'button[title*="Compartir"]',
-    '[class*="ShareGroup"] button',
-    '[class*="ActionItemContainer"] button'
-  ];
-
-  for (const selector of selectors) {
-    const el = document.querySelector(selector);
-    if (el && isVisibleElement(el)) {
-      return el;
-    }
-  }
-
-  const allButtons = [...document.querySelectorAll('button, [role="button"], span, div')];
-  for (const el of allButtons) {
-    const label = normalizeText(el.getAttribute('aria-label') || el.innerText || el.textContent || el.getAttribute('title'));
-    if (label.includes('share') || label.includes('compartir')) {
-      return el.closest('button, [role="button"]') || el;
-    }
-  }
-
-  return null;
-}
-
-function findRemoveRepostButton() {
-  const selectorList = [
-    'button', 'a', 'li', 'div[role="button"]', 'span'
-  ];
-
-  const allCandidates = [...document.querySelectorAll(selectorList.join(', '))];
-
-  for (const el of allCandidates) {
-    const text = normalizeText(
-      el.getAttribute('aria-label') ||
-      el.getAttribute('title') ||
-      el.innerText ||
-      el.textContent || ''
-    );
-
-    if (!text) continue;
-
-    const matched = [
-      'eliminar republicación',
-      'deshacer republicación',
-      'quitar republicación',
-      'eliminar repost',
-      'quitar repost',
-      'remove repost',
-      'undo repost',
-      'delete repost',
-      'remove share',
-      'delete share'
-    ].some(keyword => text.includes(keyword));
-
-    if (matched) {
-      return el.closest('button, a, li, [role="button"]') || el;
-    }
-  }
-
-  return null;
-}
-
-function findCloseButton() {
-  const selectors = [
-    'button[data-e2e="browse-close"]',
-    'button[aria-label*="Close"]',
-    'button[aria-label*="Cerrar"]',
-    '[class*="CloseIcon"]',
-    '[class*="close"] button'
-  ];
-
-  for (const selector of selectors) {
-    const el = document.querySelector(selector);
-    if (el && isVisibleElement(el)) {
-      return el.closest('button') || el;
-    }
-  }
-
-  return null;
-}
-
-async function tryCloseVideo() {
-  const closeButton = findCloseButton();
+function closeModal() {
+  const closeButton = document.querySelector('button[data-e2e="browse-close"]') || findByText(['close', 'cerrar']);
   if (closeButton) {
-    clickElement(closeButton);
-    await sleep(1500);
-    return true;
-  }
-
-  if (window.location.href.includes('/video/')) {
+    closeButton.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+  } else if (/\/(video|photo)\//.test(window.location.href)) {
     window.history.back();
-    await sleep(1800);
-    return true;
   }
-
-  return false;
 }
 
-function clickElement(element) {
-  if (!element) return;
-
-  if (typeof element.click === 'function') {
-    element.click();
-    return;
-  }
-
-  element.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
-}
-
-function normalizeText(value) {
-  return (value || '').toString().trim().toLowerCase();
-}
-
-// Utilidad para esperar (pausas humanas)
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

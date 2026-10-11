@@ -12,38 +12,34 @@ document.addEventListener('DOMContentLoaded', () => {
   let scannedVideos = [];
   let allSelected = false;
 
-  // Utils
   const updateStatus = (msg) => { statusMessage.innerText = msg; };
 
   // 1. Escanear
   btnScan.addEventListener('click', async () => {
-    updateStatus("Buscando compartidos en la página actual...");
+    updateStatus("Buscando compartidos en pantalla...");
     videoList.innerHTML = '';
     scannedVideos = [];
     selectionActions.classList.add('hidden');
 
     try {
-      // Obtener la pestaña activa
       let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      
       if (!tab.url.includes("tiktok.com")) {
         updateStatus("⚠️ Por favor, abre esta extensión estando en TikTok.");
         return;
       }
 
-      // Enviar mensaje al content script para que busque videos compartidos
       chrome.tabs.sendMessage(tab.id, { action: "SCAN_REPOSTS" }, (response) => {
         if (chrome.runtime.lastError) {
-          updateStatus("Error: Asegúrate de recargar la página de TikTok primero.");
+          updateStatus("Error: Por favor recarga la página de TikTok (F5) primero.");
           return;
         }
 
         if (response && response.success) {
           scannedVideos = response.videos;
           if (scannedVideos.length === 0) {
-            updateStatus("No se encontraron compartidos. ¿Estás en la pestaña correcta de tu perfil?");
+            updateStatus("No se encontraron compartidos visibles.");
           } else {
-            updateStatus(`¡Se encontraron ${scannedVideos.length} compartidos!`);
+            updateStatus(`¡Se encontraron ${scannedVideos.length} compartidos! También puedes marcarlos directamente en la página.`);
             renderVideoList();
             selectionActions.classList.remove('hidden');
           }
@@ -56,41 +52,67 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Renderizar la lista
+  // Renderizar la lista sincronizada
   function renderVideoList() {
     videoList.innerHTML = '';
     scannedVideos.forEach((video, index) => {
       const li = document.createElement('li');
       li.className = 'video-item';
+      
+      const isChecked = video.selected ? 'checked' : '';
       li.innerHTML = `
-        <input type="checkbox" data-index="${index}" id="video-${index}">
-        <label for="video-${index}" class="video-info">Video ${index + 1} - Haz clic para ver</label>
+        <input type="checkbox" data-url="${video.url}" id="video-${index}" ${isChecked}>
+        <label for="video-${index}" class="video-info" title="${video.url}">
+          ${video.title || `Video ${index + 1}`}
+        </label>
       `;
+
+      // Al marcar/desmarcar en el popup, actualizamos el video en tiempo real en TikTok
+      const checkbox = li.querySelector('input[type="checkbox"]');
+      checkbox.addEventListener('change', async () => {
+        let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id) {
+          chrome.tabs.sendMessage(tab.id, { 
+            action: "SET_VIDEO_SELECTED", 
+            url: video.url, 
+            selected: checkbox.checked 
+          });
+        }
+      });
+
       videoList.appendChild(li);
     });
   }
 
   // 2. Seleccionar todos
-  btnSelectAll.addEventListener('click', () => {
+  btnSelectAll.addEventListener('click', async () => {
     allSelected = !allSelected;
     const checkboxes = document.querySelectorAll('.video-item input[type="checkbox"]');
     checkboxes.forEach(cb => cb.checked = allSelected);
     btnSelectAll.innerText = allSelected ? "Deseleccionar Todos" : "Seleccionar Todos";
+
+    // Notificar a TikTok para iluminar o apagar todos los videos
+    let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id) {
+      chrome.tabs.sendMessage(tab.id, { 
+        action: "SET_ALL_SELECTED", 
+        selected: allSelected 
+      });
+    }
   });
 
   // 3. Eliminar seleccionados
   btnDeleteSelected.addEventListener('click', async () => {
     const checkboxes = document.querySelectorAll('.video-item input[type="checkbox"]:checked');
-    const indexesToDelete = Array.from(checkboxes).map(cb => parseInt(cb.getAttribute('data-index')));
+    const urlsToDelete = Array.from(checkboxes).map(cb => cb.getAttribute('data-url'));
 
-    if (indexesToDelete.length === 0) {
+    if (urlsToDelete.length === 0) {
       alert("Por favor, selecciona al menos un video para eliminar.");
       return;
     }
 
-    if (!confirm(`¿Estás seguro de que deseas eliminar ${indexesToDelete.length} compartidos?`)) return;
+    if (!confirm(`¿Estás seguro de que deseas eliminar ${urlsToDelete.length} compartidos seleccionados?`)) return;
 
-    // UI de progreso
     btnScan.disabled = true;
     selectionActions.classList.add('hidden');
     progressContainer.classList.remove('hidden');
@@ -98,31 +120,43 @@ document.addEventListener('DOMContentLoaded', () => {
     let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     
     let deletedCount = 0;
-    const totalToDelete = indexesToDelete.length;
+    let failedCount = 0;
+    let lastFailure = '';
+    const totalToDelete = urlsToDelete.length;
 
-    for (const index of indexesToDelete) {
-      const videoElement = videoList.querySelector(`input[data-index="${index}"]`).parentElement;
-      videoElement.classList.add('deleting');
-      updateStatus(`Eliminando video ${index + 1}...`);
+    for (const url of urlsToDelete) {
+      const checkbox = videoList.querySelector(`input[data-url="${url}"]`);
+      const videoElement = checkbox ? checkbox.parentElement : null;
+      if (videoElement) videoElement.style.opacity = '0.5';
 
-      // Enviar instrucción de borrar 1 video específico
+      updateStatus(`Eliminando compartido...`);
+
       await new Promise(resolve => {
-        chrome.tabs.sendMessage(tab.id, { action: "DELETE_REPOST", index: index }, (res) => {
-          if (res && res.success) {
+        chrome.tabs.sendMessage(tab.id, { action: "DELETE_REPOST", url: url }, (res) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (!runtimeError && res && res.success) {
             deletedCount++;
-            const percent = (deletedCount / totalToDelete) * 100;
-            progressFill.style.width = `${percent}%`;
-            progressText.innerText = `Eliminado: ${deletedCount} / ${totalToDelete}`;
-            videoElement.style.display = 'none'; // ocultar tras borrar
+            if (videoElement) videoElement.style.display = 'none';
+          } else {
+            failedCount++;
+            lastFailure = runtimeError?.message || res?.error || 'El content script no confirmó el borrado.';
+            if (videoElement) {
+              videoElement.style.opacity = '1';
+              videoElement.style.border = '1px solid #ff0050';
+            }
+            updateStatus(`Falló ${url.split('/').pop()}: ${lastFailure}`);
           }
-          // Esperar un poco entre borrados para parecer humano y no bloquearse
-          setTimeout(resolve, 1500 + Math.random() * 1000); 
+          const percent = ((deletedCount + failedCount) / totalToDelete) * 100;
+          progressFill.style.width = `${percent}%`;
+          progressText.innerText = `Procesados: ${deletedCount + failedCount} / ${totalToDelete}`;
+          
+          setTimeout(resolve, 2000); 
         });
       });
     }
 
-    updateStatus(`¡Proceso terminado! Se eliminaron ${deletedCount} compartidos.`);
+    updateStatus(`Eliminados ${deletedCount}, fallidos ${failedCount}.${lastFailure ? ` Último error: ${lastFailure}` : ''}`);
     btnScan.disabled = false;
-    setTimeout(() => { progressContainer.classList.add('hidden'); }, 3000);
+    setTimeout(() => { progressContainer.classList.add('hidden'); }, 4000);
   });
 });
